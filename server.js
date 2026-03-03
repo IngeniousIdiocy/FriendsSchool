@@ -259,7 +259,29 @@ async function runKeepAlive() {
         log.warn(`[KEEPALIVE] Auto-relogin failed: ${e.message} — hit GET /login manually`);
       }
     } else if (resp.ok) {
-      log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified)`);
+      // Cache the response data since we already paid for the API call
+      try {
+        const data = await resp.json();
+        if (useSchedule) {
+          if (Array.isArray(data) && data.length > 0) {
+            const text = formatScheduleData(data);
+            setCache('mae', 'schedule', text);
+            log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified, mae schedule cached)`);
+          } else {
+            log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified, no schedule data to cache)`);
+          }
+        } else {
+          if (data && typeof data === 'object' && !Array.isArray(data)) {
+            const text = formatAssignmentData(data);
+            setCache('mae', 'assignments', text);
+            log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified, mae assignments cached)`);
+          } else {
+            log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified, no assignment data to cache)`);
+          }
+        }
+      } catch (parseErr) {
+        log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified, cache update skipped: ${parseErr.message})`);
+      }
     } else {
       log.warn(`[KEEPALIVE] Unexpected status (HTTP ${resp.status}, ${label}) — session may be degraded`);
     }
