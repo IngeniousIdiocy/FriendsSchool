@@ -53,7 +53,7 @@ const STUDENTS = {
 };
 
 // Cache TTLs in milliseconds
-const ASSIGNMENT_TTL = 15 * 60 * 1000;  // 15 minutes
+const ASSIGNMENT_TTL = 30 * 60 * 1000;  // 30 minutes
 const SCHEDULE_TTL   = 60 * 60 * 1000;  // 60 minutes
 
 /* -------------------------------- logger --------------------------------- */
