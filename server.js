@@ -211,44 +211,75 @@ async function closeBrowser() {
 /* -------------------------- session keep-alive --------------------------- */
 
 let keepAliveTimer = null;
-const KEEP_ALIVE_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const KEEP_ALIVE_BASE_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const KEEP_ALIVE_JITTER = 60 * 1000; // +/- 60 seconds
+let keepAliveUseSchedule = false; // alternates between assignments and schedule
+
+function nextKeepAliveDelay() {
+  const jitter = Math.round((Math.random() * 2 - 1) * KEEP_ALIVE_JITTER);
+  return KEEP_ALIVE_BASE_INTERVAL + jitter;
+}
+
+function scheduleNextKeepAlive() {
+  const delay = nextKeepAliveDelay();
+  keepAliveTimer = setTimeout(runKeepAlive, delay);
+  keepAliveTimer.unref();
+}
+
+async function runKeepAlive() {
+  if (!browserContext) { scheduleNextKeepAlive(); return; }
+
+  const useSchedule = keepAliveUseSchedule;
+  keepAliveUseSchedule = !keepAliveUseSchedule;
+
+  let apiUrl, label;
+  if (useSchedule) {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 7);
+    apiUrl = `${BASE_URL}/api/datadirect/ScheduleList?viewerId=${STUDENTS.mae.id}&personaId=null&viewerPersonaId=null&start=${Math.floor(start.getTime() / 1000)}&end=${Math.floor(end.getTime() / 1000)}`;
+    label = 'schedule API';
+  } else {
+    apiUrl = `${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`;
+    label = 'assignments API';
+  }
+
+  try {
+    const cookie = await getCookieHeader();
+    const resp = await fetch(apiUrl, {
+      headers: { Cookie: cookie },
+      redirect: 'manual',
+    });
+    if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
+      log.warn(`[KEEPALIVE] Session expired (HTTP ${resp.status}, ${label}) — attempting auto-relogin...`);
+      try {
+        await login();
+        log.info('[KEEPALIVE] Auto-relogin succeeded');
+      } catch (e) {
+        log.warn(`[KEEPALIVE] Auto-relogin failed: ${e.message} — hit GET /login manually`);
+      }
+    } else if (resp.ok) {
+      log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, ${label} verified)`);
+    } else {
+      log.warn(`[KEEPALIVE] Unexpected status (HTTP ${resp.status}, ${label}) — session may be degraded`);
+    }
+  } catch (e) {
+    log.warn(`[KEEPALIVE] Ping failed: ${e.message}`);
+  }
+
+  scheduleNextKeepAlive();
+}
 
 function startKeepAlive() {
   stopKeepAlive();
-  keepAliveTimer = setInterval(async () => {
-    if (!browserContext) return;
-    try {
-      const cookie = await getCookieHeader();
-      // Use the real assignments API — same endpoint the scraper uses —
-      // so we detect session expiry the same way actual requests do.
-      const resp = await fetch(`${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`, {
-        headers: { Cookie: cookie },
-        redirect: 'manual',
-      });
-      if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
-        log.warn(`[KEEPALIVE] Session expired (HTTP ${resp.status}) — attempting auto-relogin...`);
-        try {
-          await login();
-          log.info('[KEEPALIVE] Auto-relogin succeeded');
-        } catch (e) {
-          log.warn(`[KEEPALIVE] Auto-relogin failed: ${e.message} — hit GET /login manually`);
-        }
-      } else if (resp.ok) {
-        log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, assignments API verified)`);
-      } else {
-        log.warn(`[KEEPALIVE] Unexpected status (HTTP ${resp.status}) — session may be degraded`);
-      }
-    } catch (e) {
-      log.warn(`[KEEPALIVE] Ping failed: ${e.message}`);
-    }
-  }, KEEP_ALIVE_INTERVAL);
-  keepAliveTimer.unref();
-  log.info(`[KEEPALIVE] Started (every ${KEEP_ALIVE_INTERVAL / 60000}min)`);
+  keepAliveUseSchedule = false;
+  scheduleNextKeepAlive();
+  log.info(`[KEEPALIVE] Started (~${KEEP_ALIVE_BASE_INTERVAL / 60000}min ±${KEEP_ALIVE_JITTER / 1000}s, alternating assignments/schedule)`);
 }
 
 function stopKeepAlive() {
   if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
+    clearTimeout(keepAliveTimer);
     keepAliveTimer = null;
   }
 }
