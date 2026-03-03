@@ -219,20 +219,24 @@ function startKeepAlive() {
     if (!browserContext) return;
     try {
       const cookie = await getCookieHeader();
-      const resp = await fetch(`${BASE_URL}/api/webapp/userstatus`, {
+      // Use the real assignments API — same endpoint the scraper uses —
+      // so we detect session expiry the same way actual requests do.
+      const resp = await fetch(`${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`, {
         headers: { Cookie: cookie },
         redirect: 'manual',
       });
       if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
-        log.warn('[KEEPALIVE] Session expired — attempting auto-relogin...');
+        log.warn(`[KEEPALIVE] Session expired (HTTP ${resp.status}) — attempting auto-relogin...`);
         try {
           await login();
           log.info('[KEEPALIVE] Auto-relogin succeeded');
         } catch (e) {
           log.warn(`[KEEPALIVE] Auto-relogin failed: ${e.message} — hit GET /login manually`);
         }
+      } else if (resp.ok) {
+        log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status}, assignments API verified)`);
       } else {
-        log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status})`);
+        log.warn(`[KEEPALIVE] Unexpected status (HTTP ${resp.status}) — session may be degraded`);
       }
     } catch (e) {
       log.warn(`[KEEPALIVE] Ping failed: ${e.message}`);
@@ -605,6 +609,29 @@ function formatScheduleData(items) {
   return lines.join('\n');
 }
 
+/* ----------------------- auto-relogin helper ----------------------------- */
+
+let reloginInProgress = null; // prevent concurrent relogin attempts
+
+async function attemptRelogin(reason) {
+  if (reloginInProgress) {
+    log.info(`[RELOGIN] Already in progress, waiting...`);
+    return reloginInProgress;
+  }
+  log.warn(`[RELOGIN] Session expired during ${reason} — attempting auto-relogin...`);
+  reloginInProgress = login()
+    .then(() => {
+      log.info(`[RELOGIN] Auto-relogin succeeded (triggered by ${reason})`);
+      return true;
+    })
+    .catch((e) => {
+      log.warn(`[RELOGIN] Auto-relogin failed: ${e.message} — hit GET /login manually`);
+      return false;
+    })
+    .finally(() => { reloginInProgress = null; });
+  return reloginInProgress;
+}
+
 /* ---------------------- data fetching with cache ------------------------- */
 
 function freshnessLabel(isoString, source) {
@@ -635,6 +662,23 @@ async function getAssignments(child) {
     return { data: entry.data, freshness: freshnessLabel(entry.lastUpdated, 'live') };
   } catch (e) {
     log.warn(`[DATA] ${student.name} assignments — SCRAPE FAILED: ${e.message}`);
+
+    // If session expired, attempt auto-relogin and retry once
+    if (e.message.includes('Session expired')) {
+      const reloggedIn = await attemptRelogin(`${student.name} assignments`);
+      if (reloggedIn) {
+        try {
+          const text = await scrapeAssignments(student.id);
+          const chars = text.length;
+          const entry = setCache(child, 'assignments', text);
+          log.info(`[DATA] ${student.name} assignments — SCRAPED OK after relogin (${chars} chars)`);
+          return { data: entry.data, freshness: freshnessLabel(entry.lastUpdated, 'live') };
+        } catch (e2) {
+          log.warn(`[DATA] ${student.name} assignments — SCRAPE FAILED after relogin: ${e2.message}`);
+        }
+      }
+    }
+
     if (cached) {
       log.info(`[DATA] ${student.name} assignments — falling back to stale data (${timeAgo(cached.lastUpdated)})`);
       return { data: cached.data, freshness: freshnessLabel(cached.lastUpdated, 'stale') };
@@ -662,6 +706,23 @@ async function getSchedule(child) {
     return { data: entry.data, freshness: freshnessLabel(entry.lastUpdated, 'live') };
   } catch (e) {
     log.warn(`[DATA] ${student.name} schedule — SCRAPE FAILED: ${e.message}`);
+
+    // If session expired, attempt auto-relogin and retry once
+    if (e.message.includes('Session expired')) {
+      const reloggedIn = await attemptRelogin(`${student.name} schedule`);
+      if (reloggedIn) {
+        try {
+          const text = await scrapeSchedule(student.id);
+          const chars = text.length;
+          const entry = setCache(child, 'schedule', text);
+          log.info(`[DATA] ${student.name} schedule — SCRAPED OK after relogin (${chars} chars)`);
+          return { data: entry.data, freshness: freshnessLabel(entry.lastUpdated, 'live') };
+        } catch (e2) {
+          log.warn(`[DATA] ${student.name} schedule — SCRAPE FAILED after relogin: ${e2.message}`);
+        }
+      }
+    }
+
     if (cached) {
       log.info(`[DATA] ${student.name} schedule — falling back to stale data (${timeAgo(cached.lastUpdated)})`);
       return { data: cached.data, freshness: freshnessLabel(cached.lastUpdated, 'stale') };
