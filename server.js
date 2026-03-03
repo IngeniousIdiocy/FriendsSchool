@@ -224,7 +224,13 @@ function startKeepAlive() {
         redirect: 'manual',
       });
       if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
-        log.warn('[KEEPALIVE] Session expired — hit GET /login to re-authenticate');
+        log.warn('[KEEPALIVE] Session expired — attempting auto-relogin...');
+        try {
+          await login();
+          log.info('[KEEPALIVE] Auto-relogin succeeded');
+        } catch (e) {
+          log.warn(`[KEEPALIVE] Auto-relogin failed: ${e.message} — hit GET /login manually`);
+        }
       } else {
         log.info(`[KEEPALIVE] Session alive (HTTP ${resp.status})`);
       }
@@ -253,6 +259,74 @@ function isLoginPage(url) {
          url.includes('blackbaud.com/signin');
 }
 
+/**
+ * Try to click through the Blackbaud SSO login automatically.
+ * The browser profile has a saved Google session, so we just need to:
+ *   1. Wait for auto-SSO redirects (often completes with zero clicks)
+ *   2. If stuck on signin page, click the saved email / "Use Google" button
+ * Returns true if login completed, false if manual intervention needed.
+ */
+async function attemptAutoLogin(page) {
+  const buttonSelectors = [
+    // Blackbaud "Next" button (submits saved email, triggers SSO)
+    '#nextBtn',
+    // Google SSO buttons on Blackbaud signin page
+    'button:has-text("Google")',
+    'a:has-text("Google")',
+    'button:has-text("Use Google")',
+    'a:has-text("Use Google")',
+    'button:has-text("Sign in with Google")',
+    'a:has-text("Sign in with Google")',
+    // Generic fallbacks
+    'button:has-text("Sign in")',
+    'button:has-text("Continue")',
+  ];
+
+  // Loop: wait for redirects, look for buttons, click, repeat
+  // Each iteration waits a bit then checks if done or finds a button to click
+  const deadline = Date.now() + 30000; // 30 second timeout for auto-login
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Check if we're done — verify by extracting cookies and testing with fetch
+    try {
+      const url = page.url();
+      log.info(`[LOGIN] Auto-login check — ${url.slice(0, 100)}`);
+      if (url.includes('myschoolapp.com/app') && !isLoginPage(url)) {
+        const cookies = await page.context().cookies(BASE_URL);
+        const cookie = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        const testResp = await fetch(`${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`, {
+          headers: { Cookie: cookie },
+          redirect: 'manual',
+        });
+        if (testResp.ok) {
+          log.info(`[LOGIN] Auto-login succeeded (${cookies.length} cookies, fetch verified)`);
+          return true;
+        }
+        log.info(`[LOGIN] URL looks logged in but fetch got HTTP ${testResp.status}, continuing...`);
+      }
+    } catch { continue; }
+
+    // Look for a button to click on the current page
+    for (const sel of buttonSelectors) {
+      try {
+        const el = await page.locator(sel).first();
+        if (await el.isVisible({ timeout: 500 })) {
+          const text = await el.textContent().catch(() => sel);
+          log.info(`[LOGIN] Clicking: "${text.trim().slice(0, 50)}" (${sel})`);
+          await el.click();
+          // Wait for navigation after click
+          await new Promise(r => setTimeout(r, 3000));
+          break; // go back to the outer loop to re-check URL and find next button
+        }
+      } catch { continue; }
+    }
+  }
+
+  return false;
+}
+
 async function login() {
   // Close any existing browser — can't share profile between instances
   await closeBrowser();
@@ -262,34 +336,58 @@ async function login() {
   const page = await ctx.newPage();
   const loginUrl = `${BASE_URL}/app`;
   log.info(`Opening login page: ${loginUrl}`);
-  log.info('Please log in via the browser window...');
 
   try {
     await page.goto(loginUrl, { waitUntil: 'commit', timeout: 120000 });
   } catch (e) {
     log.warn(`Initial navigation: ${e.message} — continuing anyway`);
   }
+
+  // Wait for JS redirects to settle before checking anything
+  await new Promise(r => setTimeout(r, 3000));
   log.info(`Page loaded, current URL: ${page.url()}`);
 
-  // Poll for login completion — check every 3 seconds for up to 5 minutes
-  log.info('Waiting for login to complete (up to 5 minutes)...');
-  const deadline = Date.now() + 300000;
+  // Verify session by extracting cookies and testing with Node.js fetch
+  // (this is the same path our actual data fetching uses)
   let success = false;
-
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 3000));
-    let currentUrl;
-    try {
-      currentUrl = page.url();
-    } catch {
-      continue;
-    }
-    log.info(`Login check — URL: ${currentUrl}`);
-    if (currentUrl.includes('myschoolapp.com/app') && !isLoginPage(currentUrl)) {
-      log.info('Login successful!');
-      await new Promise(r => setTimeout(r, 2000));
+  try {
+    const cookies = await ctx.cookies(BASE_URL);
+    const cookie = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    log.info(`[LOGIN] Got ${cookies.length} cookies, testing with fetch...`);
+    const testResp = await fetch(`${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`, {
+      headers: { Cookie: cookie },
+      redirect: 'manual',
+    });
+    if (testResp.ok) {
+      log.info('[LOGIN] Session already valid (verified with fetch)!');
       success = true;
-      break;
+    } else {
+      log.info(`[LOGIN] Session not valid (HTTP ${testResp.status}), need to login`);
+    }
+  } catch (e) {
+    log.info(`[LOGIN] Session check failed: ${e.message}`);
+  }
+
+  // Try auto-login (SSO redirects + button clicks)
+  if (!success) {
+    success = await attemptAutoLogin(page);
+  }
+
+  // Fall back to manual login
+  if (!success) {
+    log.info('Auto-login failed — please log in via the browser window (up to 5 minutes)...');
+    const deadline = Date.now() + 300000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const cookies = await ctx.cookies(BASE_URL);
+        const cookie = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        const testResp = await fetch(`${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${STUDENTS.mae.id}`, {
+          headers: { Cookie: cookie },
+          redirect: 'manual',
+        });
+        if (testResp.ok) { success = true; break; }
+      } catch { continue; }
     }
   }
 
@@ -299,17 +397,20 @@ async function login() {
     throw new Error('Login timed out — please try again');
   }
 
-  // Move the browser window offscreen so it never appears during scraping
-  // (minimized windows pop back up on navigation — offscreen stays hidden)
+  log.info('Login successful!');
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Minimize the browser window — since we no longer navigate any pages
+  // after login (all data fetching uses Node.js fetch), it won't pop back up
   try {
     const cdp = await ctx.newCDPSession(page);
     const { windowId } = await cdp.send('Browser.getWindowForTarget');
     await cdp.send('Browser.setWindowBounds', {
       windowId,
-      bounds: { left: -9999, top: -9999, windowState: 'normal' },
+      bounds: { windowState: 'minimized' },
     });
   } catch (e) {
-    log.warn(`Could not move browser offscreen: ${e.message}`);
+    log.warn(`Could not minimize browser: ${e.message}`);
   }
 
   // Close the login tab — browser process stays alive offscreen
@@ -319,7 +420,7 @@ async function login() {
   browserContext = ctx;
   browserHeadless = false;
   startKeepAlive();
-  log.info('Login complete. Browser moved offscreen for scraping (session preserved).');
+  log.info('Login complete. Browser moved offscreen (session preserved).');
   return { success: true };
 }
 
