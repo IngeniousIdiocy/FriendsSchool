@@ -5,23 +5,16 @@ Natural language query agent for Friends School of Baltimore (Blackbaud MySchool
 ## Architecture
 
 ```
-Siri Shortcut → HTTP POST /nl → Claude API (with tools) → Playwright scraper → Blackbaud
-                                                         ← structured data ←
+Siri Shortcut → HTTP POST /nl → Claude API (with tools) → Node.js fetch → Blackbaud API
+                                                         ← structured JSON ←
                                  ← natural language answer ←
 ```
 
 Single Node.js server with:
-- **Playwright** persistent browser profile — login once via Google SSO, sessions persist across restarts
-- **On-demand scraping** with memory + disk caching (15min assignments, 60min schedules)
+- **Playwright** persistent browser profile — login once via Google SSO, browser stays alive offscreen for session persistence
+- **Cookie-based API calls** — after login, all data fetching uses Node.js `fetch()` with cookies extracted from the browser context (no browser windows ever appear after login)
+- **On-demand fetching** with memory + disk caching (15min assignments, 60min schedules)
 - **Claude agentic loop** — Claude decides which tools to call based on your query
-- **DOM text extraction** via `document.body.innerText` (avoids CSRF-locked APIs)
-
-## Students
-
-| Name | ID | Grade | School |
-|------|----|-------|--------|
-| Mae | 6429913 | 6th | Middle School |
-| Effie | 6429999 | 4th | Lower School |
 
 ## Setup
 
@@ -38,34 +31,33 @@ npx playwright install chromium
 | `ANTHROPIC_API_KEY` | (required) | Claude API key for /nl endpoint |
 | `PORT` | `3082` | HTTP server port |
 | `BROWSER_PROFILE_PATH` | `~/.friendsschool-profile` | Playwright persistent profile directory |
-| `HEADLESS` | `false` | Set `true` after initial login |
-| `FRIENDSSCHOOL_MODEL` | `claude-haiku-4-5` | Claude model for NL queries |
+| `FRIENDSSCHOOL_MODEL` | `claude-sonnet-4-6` | Claude model for NL queries |
 | `MAX_TOOL_ITERATIONS` | `10` | Max agentic loop iterations |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
-These can be set in the `.env` file or as environment variables.
+These can be set in a `.env` file or as environment variables.
 
-## First-Run Authentication
+## Authentication
 
-1. Start the server (non-headless, the default):
+1. Start the server:
    ```bash
    node server.js
    ```
-2. Send any query to trigger the browser launch:
+2. Hit the login endpoint:
    ```bash
-   curl -X POST http://localhost:3082/nl \
-     -H 'Content-Type: application/json' \
-     -d '{"command":"what does mae have due tomorrow?"}'
+   curl http://localhost:3082/login
    ```
-3. A Chromium window opens → log in via Google SSO on the Blackbaud page
-4. After login, the session is saved to the profile directory
-5. Stop the server, set `HEADLESS=true` in `.env`, restart:
-   ```bash
-   # In .env:
-   HEADLESS=true
-   ```
+3. A Chromium window opens — log in via Google SSO on the Blackbaud page
+4. After login, the browser moves offscreen and the session persists
+5. The server is now ready for queries
+
+Sessions last hours but eventually expire. If you get "Session expired" errors, hit `GET /login` again.
 
 ## API Endpoints
+
+### `GET /login` — Authenticate
+
+Opens a visible browser for Google SSO login. After login, the browser moves offscreen and stays alive to preserve the session. Returns `{"ok": true}` on success.
 
 ### `POST /nl` — Natural Language Query
 
@@ -84,13 +76,7 @@ Main interface. Send a question, get a natural language answer.
   "response": "Mae has 3 assignments due this week: ...",
   "iterations": 2,
   "toolCalls": 1,
-  "dataFreshness": {
-    "mae": {
-      "assignments": { "lastUpdated": "2026-03-02T15:30:00Z", "age": "2min ago" },
-      "schedule": { "lastUpdated": null, "age": "never" }
-    },
-    "effie": { ... }
-  }
+  "dataFreshness": { ... }
 }
 ```
 
@@ -98,34 +84,35 @@ Main interface. Send a question, get a natural language answer.
 - "What does Mae have due tomorrow?"
 - "Does Effie have any overdue assignments?"
 - "What's the kids' schedule today?"
-- "What's Mae's homework situation?"
+- "Where is Mae right now?"
 - "Does anyone have anything due this week?"
 
 ### `GET /health` — Health Check
 
-```json
-{
-  "ok": true,
-  "now": "2026-03-02T15:30:00Z",
-  "browserReady": true,
-  "cached": { ... }
-}
-```
+Returns server status, browser readiness, and cache freshness.
 
 ### `GET /data` — Raw Cached Data
 
-Returns all cached data with freshness timestamps. Useful for debugging.
+Returns all cached data with freshness timestamps.
 
 ## Caching Strategy
 
 | Data Type | Cache TTL | Disk Persistence |
 |-----------|-----------|------------------|
-| Assignments | 15 minutes | `data/mae-assignments.json`, `data/effie-assignments.json` |
-| Schedules | 60 minutes | `data/mae-schedule.json`, `data/effie-schedule.json` |
+| Assignments | 15 minutes | `data/{child}-assignments.json` |
+| Schedules | 60 minutes | `data/{child}-schedule.json` |
 
-- **On startup:** disk data is loaded into memory cache for instant first responses
-- **On cache miss:** live scrape via Playwright → cached to memory + disk
-- **On scrape failure:** stale data served with a warning about when it was last updated
+- **On startup:** disk data is loaded into memory for instant first responses
+- **On cache miss:** live API fetch → cached to memory + disk
+- **On fetch failure:** stale data served with a warning about when it was last updated
+
+## Data Sources
+
+| Data | Blackbaud API | Notes |
+|------|--------------|-------|
+| Assignments | `/api/assignment2/ParentStudentAssignmentCenterGet` | Structured JSON with time buckets (due today/tomorrow/this week, overdue, etc.) |
+| Schedule | `/api/datadirect/ScheduleList` | Monthly schedule with teacher names, room numbers, buildings |
+| Session keepalive | `/api/webapp/userstatus` | Pinged every 10 minutes to keep the session alive |
 
 ## Siri Shortcut Configuration
 
@@ -142,38 +129,13 @@ Create a Shortcut with:
 
 This lets you say "Hey Siri, school query" → speak your question → hear the answer.
 
-## Data Sources
-
-| Data | Blackbaud URL Pattern | Notes |
-|------|----------------------|-------|
-| Assignments | `/lms-assignment/assignment-center/parent/{id}` | Active assignments with status, due dates, points, class |
-| Schedule | `/sis-scheduling/user-calendar/{id}` | Monthly calendar. Mae has full Gray/Scarlet day rotation. Effie only shows Homeroom. |
-
 ## Troubleshooting
 
 ### "Session expired" error
-The Blackbaud session has expired. Restart with `HEADLESS=false`, send a query, and re-authenticate in the browser window.
+Hit `GET /login` to re-authenticate in the browser window.
 
 ### Browser won't launch
 Ensure Playwright Chromium is installed: `npx playwright install chromium`
 
-### Stale data warnings
-Data older than the cache TTL triggers a live scrape. If scraping fails, stale data is served with a timestamp warning. Check the `/health` endpoint for freshness info.
-
 ### Port conflict
-Change the port in `.env` or via `PORT=3083 node server.js`.
-
-## File Structure
-
-```
-FriendsSchool/
-├── server.js          # Single-file server (browser, scrapers, cache, Claude loop, HTTP)
-├── package.json
-├── .env               # Configuration
-├── data/              # Disk-persisted cache (auto-created)
-│   ├── mae-assignments.json
-│   ├── mae-schedule.json
-│   ├── effie-assignments.json
-│   └── effie-schedule.json
-└── README.md
-```
+Change the port via `.env` or `PORT=3083 node server.js`.
