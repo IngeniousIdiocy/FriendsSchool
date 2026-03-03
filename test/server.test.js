@@ -9,8 +9,6 @@ const os = require('os');
 
 // Suppress logs during tests
 process.env.LOG_LEVEL = 'error';
-// Prevent auto-start side effects
-process.env.HEADLESS = 'true';
 
 // Use temp dir for data so tests never pollute real data/
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'friendsschool-test-'));
