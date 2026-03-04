@@ -56,6 +56,15 @@ const STUDENTS = {
 const ASSIGNMENT_TTL = 30 * 60 * 1000;  // 30 minutes
 const SCHEDULE_TTL   = 60 * 60 * 1000;  // 60 minutes
 
+// Effie's static weekly schedule (Lower School doesn't use the calendar API)
+const EFFIE_SCHEDULE_PATH = path.join(DATA_DIR, 'effie-schedule.csv');
+let EFFIE_STATIC_SCHEDULE = null;
+try {
+  EFFIE_STATIC_SCHEDULE = fs.readFileSync(EFFIE_SCHEDULE_PATH, 'utf8');
+} catch {
+  // Will be loaded later if DATA_DIR changes (tests)
+}
+
 /* -------------------------------- logger --------------------------------- */
 
 function nowIso() { return new Date().toISOString(); }
@@ -744,6 +753,16 @@ async function getSchedule(child) {
   const student = STUDENTS[child];
   if (!student) return { error: `Unknown child: ${child}` };
 
+  // Effie's schedule is static — no API call needed
+  if (child === 'effie') {
+    const csv = EFFIE_STATIC_SCHEDULE || (() => { try { return fs.readFileSync(EFFIE_SCHEDULE_PATH, 'utf8'); } catch { return null; } })();
+    if (csv) {
+      log.info(`[DATA] Effie schedule — static file`);
+      return { data: csv, freshness: 'Static schedule for the 2025-2026 school year.' };
+    }
+    return { error: "Effie's static schedule file not found." };
+  }
+
   const cached = getCached(child, 'schedule');
   if (cached && isFresh(cached.lastUpdated, SCHEDULE_TTL)) {
     log.info(`[DATA] ${student.name} schedule — CACHE HIT (${timeAgo(cached.lastUpdated)})`);
@@ -804,7 +823,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'get_schedule',
-    description: "Get a child's class schedule/calendar from Blackbaud. Mae (Middle School) has a full rotation schedule with Gray/Scarlet days. Effie (Lower School) only shows Homeroom.",
+    description: "Get a child's class schedule. Mae (Middle School) has a daily rotation schedule from Blackbaud with Gray/Scarlet days. Effie (Lower School) has a fixed weekly schedule.",
     input_schema: {
       type: 'object',
       properties: {
@@ -867,7 +886,7 @@ Today is ${dayOfWeek}, ${dateStr}.
 
 Children:
 - Mae (6th Grade, Middle School) — has a full rotation schedule with Gray/Scarlet days
-- Effie (4th Grade, Lower School) — schedule only shows Homeroom
+- Effie (4th Grade, Lower School) — has a fixed weekly schedule (same every week)
 
 You have tools to fetch their assignments and schedules from Blackbaud. Use the appropriate tool(s) based on the query. For broad queries about "the kids" or "both", use get_all_data. Questions like "where is Mae right now", "what are the kids doing", or "what class does Effie have" are SCHEDULE questions — always fetch the schedule for those.
 
@@ -878,12 +897,18 @@ RESPONSE FORMAT — follow this strictly:
 4. NEVER hallucinate or guess the data age. Use ONLY the "freshness" field provided in the tool result.
 
 SCHEDULE RESPONSES:
-- Every class you mention MUST include ALL of these: class name, teacher name, start–end times, and room number
+- For Mae: Every class you mention MUST include ALL of these: class name, teacher name, start–end times, and room number
 - SIMPLIFY class names: strip section numbers, block letters, and codes. Say "Science" not "Science 6 - 04 (D)". Say "Mathematics" not "Mathematics 6 - 01 (A)". Say "French" not "French 6 - 02 (C)". Just use the plain subject name.
 - Example: "French with Ms. Hughes, 2:05–2:55 PM, Middle School 225"
 - If asked about a specific time, give the one relevant class with all four details
 - If asked for "the schedule" or "all classes", list the full day with all four details per class
 - Do NOT list the full schedule unless the user asks for it
+
+EFFIE'S SCHEDULE (special rules):
+- Effie's schedule is a fixed weekly CSV. It has the same classes every Monday, every Tuesday, etc.
+- "GL MFW" means "Meeting for Worship" — this is a Quaker school. Always say "Meeting for Worship", never "GL MFW".
+- Fridays have TWO possible schedules: "Assembly" or "Meeting for Worship" Fridays. They differ ONLY in the last two periods (12:55–2:50). We do not know which Friday type any given week will be.
+- Only mention the Friday ambiguity if the query specifically covers the affected time slots (12:55–2:50 on a Friday). If so, present both possibilities with a brief caveat. Otherwise just answer normally — most of Friday's schedule is the same either way.
 
 ASSIGNMENT RESPONSES:
 - Format due dates relative to today (e.g., "tomorrow", "this Friday")
