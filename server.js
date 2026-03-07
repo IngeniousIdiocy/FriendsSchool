@@ -223,6 +223,7 @@ let keepAliveTimer = null;
 const KEEP_ALIVE_BASE_INTERVAL = 10 * 60 * 1000; // 10 minutes
 const KEEP_ALIVE_JITTER = 60 * 1000; // +/- 60 seconds
 let keepAliveUseSchedule = false; // alternates between assignments and schedule
+let keepAliveConsecutiveFailures = 0;
 
 function nextKeepAliveDelay() {
   const jitter = Math.round((Math.random() * 2 - 1) * KEEP_ALIVE_JITTER);
@@ -294,8 +295,13 @@ async function runKeepAlive() {
     } else {
       log.warn(`[KEEPALIVE] Unexpected status (HTTP ${resp.status}, ${label}) — session may be degraded`);
     }
+    keepAliveConsecutiveFailures = 0;
   } catch (e) {
-    log.warn(`[KEEPALIVE] Ping failed: ${e.message}`);
+    keepAliveConsecutiveFailures++;
+    if (keepAliveConsecutiveFailures <= 3 || keepAliveConsecutiveFailures % 6 === 0) {
+      // Log first 3 failures, then every ~hour (6 x 10min) after that
+      log.warn(`[KEEPALIVE] Network unreachable: ${e.message} (${keepAliveConsecutiveFailures} consecutive failure${keepAliveConsecutiveFailures > 1 ? 's' : ''})`);
+    }
   }
 
   scheduleNextKeepAlive();
@@ -1121,6 +1127,29 @@ function createRequestHandler() {
           });
         } catch (e) {
           log.error('[NL] Error:', e.message);
+
+          // If it's a network error, return cached data with 503 so the caller
+          // (OpenClaw) can still provide useful information
+          const isNetworkError = /fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN/i.test(e.message);
+          if (isNetworkError) {
+            const cachedData = {};
+            for (const child of Object.keys(STUDENTS)) {
+              cachedData[child] = {};
+              for (const type of ['assignments', 'schedule']) {
+                const entry = getCached(child, type);
+                cachedData[child][type] = entry || null;
+              }
+            }
+            log.info('[NL] Returning cached data with 503 (network unavailable)');
+            return sendJson(503, {
+              ok: false,
+              error: 'AI assistant temporarily unavailable (network issue)',
+              command,
+              cachedData,
+              dataFreshness: buildFreshnessInfo(),
+            });
+          }
+
           return sendJson(500, { ok: false, error: e.message });
         }
       }
