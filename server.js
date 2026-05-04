@@ -67,15 +67,39 @@ try {
 
 /* -------------------------------- logger --------------------------------- */
 
+const util = require('util');
+
 function nowIso() { return new Date().toISOString(); }
+
+const LOG_FILE = path.join(DATA_DIR, 'server.log');
+const LOG_MAX_BYTES = 10 * 1024 * 1024;
+
+function openLogStream() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    try {
+      const st = fs.statSync(LOG_FILE);
+      if (st.size > LOG_MAX_BYTES) {
+        fs.renameSync(LOG_FILE, LOG_FILE + '.1');
+      }
+    } catch { /* file doesn't exist yet */ }
+    return fs.createWriteStream(LOG_FILE, { flags: 'a' });
+  } catch (e) {
+    console.error(`[${nowIso()}] [ERROR] Failed to open log file: ${e.message}`);
+    return null;
+  }
+}
 
 function createLogger() {
   const level = (process.env.LOG_LEVEL || 'info').toLowerCase();
   const order = { debug: 10, info: 20, warn: 30, error: 40 };
   const threshold = order[level] ?? order.info;
+  const fileStream = openLogStream();
   function log(lvl, ...args) {
     if ((order[lvl] ?? 20) < threshold) return;
-    console.log(`[${nowIso()}] [${lvl.toUpperCase()}]`, ...args);
+    const line = `[${nowIso()}] [${lvl.toUpperCase()}] ${util.format(...args)}`;
+    console.log(line);
+    if (fileStream) fileStream.write(line + '\n');
   }
   return {
     debug: (...a) => log('debug', ...a),
@@ -148,6 +172,12 @@ function getCached(child, type) {
   return cache[key] || null;
 }
 
+function invalidateCache(child, type) {
+  const key = `${child}-${type}`;
+  delete cache[key];
+  try { fs.unlinkSync(path.join(DATA_DIR, `${key}.json`)); } catch {}
+}
+
 function setCache(child, type, data) {
   const key = `${child}-${type}`;
   const entry = { lastUpdated: nowIso(), data };
@@ -206,6 +236,69 @@ async function getCookieHeader() {
   const ctx = await getBrowser();
   const cookies = await ctx.cookies(BASE_URL);
   return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+}
+
+// A long-lived "scratch" page kept open in the headless context. We use it
+// to make API calls that require the antiforgery token Blackbaud's SPA
+// generates client-side — page.evaluate() runs inside the page's origin,
+// so cookies + verification token are added automatically by their JS.
+let scratchPage = null;
+async function getScratchPage() {
+  const ctx = await getBrowser();
+  if (scratchPage && !scratchPage.isClosed()) return scratchPage;
+  scratchPage = await ctx.newPage();
+  await scratchPage.goto(`${BASE_URL}/app/parent?svcid=edu`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  return scratchPage;
+}
+
+/**
+ * Make an authenticated Blackbaud API call from inside the existing
+ * browser context. Use this for endpoints that require the antiforgery
+ * `requestverificationtoken` header (e.g. /api/mycalendar/events) — the
+ * SPA's own JS attaches the token to fetch() automatically when the call
+ * originates from a page on the friendsbalt.myschoolapp.com origin.
+ */
+async function browserApiCall(apiPath, { method = 'GET', body, extraHeaders } = {}) {
+  const page = await getScratchPage();
+  const result = await page.evaluate(async ({ apiPath, method, body, extraHeaders }) => {
+    // Try to discover the antiforgery token from common Blackbaud locations.
+    function findToken() {
+      for (const g of ['RequestVerificationToken', 'requestVerificationToken', 'headerVerificationToken']) {
+        if (typeof window[g] === 'string' && window[g]) return window[g];
+      }
+      const meta = document.querySelector('meta[name="request-verification-token"]');
+      if (meta && meta.getAttribute('content')) return meta.getAttribute('content');
+      const inp = document.querySelector('input[name="__RequestVerificationToken"]');
+      if (inp && inp.value) return inp.value;
+      return null;
+    }
+    const token = findToken();
+    const headers = {
+      'Accept': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      ...(extraHeaders || {}),
+    };
+    if (body) headers['Content-Type'] = 'application/json';
+    if (token) headers['requestverificationtoken'] = token;
+    const resp = await fetch(apiPath, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include',
+      redirect: 'manual',
+    });
+    const text = await resp.text();
+    return { status: resp.status, ok: resp.ok, body: text, tokenFound: !!token };
+  }, { apiPath, method, body, extraHeaders });
+
+  if (result.status === 401 || result.status === 403 || (result.status >= 300 && result.status < 400)) {
+    throw new Error('Session expired — hit GET /login to re-authenticate');
+  }
+  if (!result.ok) {
+    throw new Error(`Blackbaud browser API ${apiPath} failed: HTTP ${result.status}${result.tokenFound ? '' : ' (no antiforgery token found on scratch page)'}`);
+  }
+  try { return JSON.parse(result.body); }
+  catch { return { __nonJson: true, status: result.status, body: result.body.slice(0, 4000) }; }
 }
 
 async function closeBrowser() {
@@ -498,30 +591,54 @@ async function login() {
 
 /* ------------------------------ scrapers --------------------------------- */
 
-async function scrapeAssignments(studentId) {
-  log.info(`Scraping assignments for student ${studentId} via API`);
+/**
+ * Generic Blackbaud API call using the server's authenticated cookies.
+ * Path may be absolute (`https://...`) or relative (`/api/...`).
+ * Returns parsed JSON. Throws "Session expired" on 401/403/3xx so callers can
+ * trigger auto-relogin.
+ */
+async function blackbaudFetch(path, { method = 'GET', body, extraHeaders } = {}) {
   const cookie = await getCookieHeader();
-
-  const apiUrl = `${BASE_URL}/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${studentId}`;
-  log.info(`Calling ParentStudentAssignmentCenterGet API`);
-  const resp = await fetch(apiUrl, {
-    headers: { Cookie: cookie },
+  const url = path.startsWith('http') ? path : `${BASE_URL}${path}`;
+  const headers = { Cookie: cookie, ...(extraHeaders || {}) };
+  if (body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  const resp = await fetch(url, {
+    method,
+    headers,
+    body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
     redirect: 'manual',
   });
-
   if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
     throw new Error('Session expired — hit GET /login to re-authenticate');
   }
   if (!resp.ok) {
-    throw new Error(`Assignment API failed: HTTP ${resp.status}`);
+    throw new Error(`Blackbaud API ${path} failed: HTTP ${resp.status}`);
   }
+  const text = await resp.text();
+  // Many Blackbaud endpoints return JSON; some HTML pages slip through if the
+  // session is half-expired. Return the raw text in that case for the caller
+  // to inspect.
+  try { return JSON.parse(text); }
+  catch { return { __nonJson: true, status: resp.status, body: text.slice(0, 4000) }; }
+}
 
-  const data = await resp.json();
-
-  if (!data || typeof data !== 'object') {
+async function fetchRawAssignments(studentId) {
+  log.info(`Fetching assignments for student ${studentId} via API`);
+  const data = await blackbaudFetch(`/api/assignment2/ParentStudentAssignmentCenterGet?StudentUserId=${studentId}`);
+  if (!data || typeof data !== 'object' || data.__nonJson) {
     throw new Error('Session expired — hit GET /login to re-authenticate');
   }
+  // Persist for offline inspection
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, `assignments-raw-${studentId}.json`), JSON.stringify(data, null, 2));
+  } catch (e) {
+    log.warn(`Failed to save raw assignments JSON: ${e.message}`);
+  }
+  return data;
+}
 
+async function scrapeAssignments(studentId) {
+  const data = await fetchRawAssignments(studentId);
   return formatAssignmentData(data);
 }
 
@@ -595,41 +712,201 @@ function formatAssignmentData(data) {
   return lines.join('\n');
 }
 
-async function scrapeSchedule(studentId) {
-  log.info(`Scraping schedule for student ${studentId} via API`);
-  const cookie = await getCookieHeader();
+/**
+ * Fetch the parent /api/mycalendar/events response for a date range.
+ * Unlike ScheduleList, this includes athletic event details — EventType
+ * ("Practice"/"Game"), Opponent, HomeAway, Location, Cancelled, etc.
+ *
+ * Requires the antiforgery token, so it routes through `browserApiCall`.
+ *
+ * The `filterString` selects which calendars to include and is user-specific
+ * (Mae's teams, school events, etc.). Stored in `data/calendar-filter.txt`
+ * — capture it once from a parent's browser DevTools (POST body of any
+ * /api/mycalendar/events call) and drop it in. Re-capture each season when
+ * teams change.
+ */
+function loadCalendarFilter() {
+  try {
+    return fs.readFileSync(path.join(DATA_DIR, 'calendar-filter.txt'), 'utf8').trim();
+  } catch { return null; }
+}
 
-  // Call the ScheduleList API directly to get structured data with teacher/room info
+function mmddyyyy(d) {
+  return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
+}
+
+async function fetchRawCalendar({ startDate, endDate, filterString } = {}) {
+  const filter = filterString || loadCalendarFilter();
+  if (!filter) {
+    throw new Error('No calendar filter configured. Drop a comma-separated filterString into data/calendar-filter.txt (capture it from /api/mycalendar/events POST body in DevTools).');
+  }
+  const now = new Date();
+  const start = startDate ? new Date(startDate) : new Date(now.getFullYear(), now.getMonth(), 1);
+  const end = endDate ? new Date(endDate) : new Date(now.getFullYear(), now.getMonth() + 1, 7);
+  log.info(`Fetching mycalendar/events ${mmddyyyy(start)} → ${mmddyyyy(end)}`);
+  const data = await browserApiCall('/api/mycalendar/events', {
+    method: 'POST',
+    body: {
+      bulkURL: 'mycalendar/events',
+      startDate: mmddyyyy(start),
+      endDate: mmddyyyy(end),
+      filterString: filter,
+      showPractice: true,
+      recentSave: false,
+    },
+  });
+  if (!Array.isArray(data)) {
+    throw new Error('Session expired — hit GET /login to re-authenticate');
+  }
+  log.info(`mycalendar/events returned ${data.length} items`);
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, 'mycalendar-raw.json'), JSON.stringify(data, null, 2));
+  } catch (e) {
+    log.warn(`Failed to save raw mycalendar JSON: ${e.message}`);
+  }
+  return data;
+}
+
+async function fetchRawSchedule(studentId) {
+  log.info(`Fetching schedule for student ${studentId} via API`);
+  // Default range: 1st of current month → 7 days into next month (matches Blackbaud's monthly view)
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
   const end = new Date(now.getFullYear(), now.getMonth() + 1, 7);
   const startUnix = Math.floor(start.getTime() / 1000);
   const endUnix = Math.floor(end.getTime() / 1000);
-  const apiUrl = `${BASE_URL}/api/datadirect/ScheduleList?viewerId=${studentId}&personaId=null&viewerPersonaId=null&start=${startUnix}&end=${endUnix}`;
-
-  log.info(`Calling ScheduleList API`);
-  const resp = await fetch(apiUrl, {
-    headers: { Cookie: cookie },
-    redirect: 'manual',
-  });
-
-  if (resp.status === 401 || resp.status === 403 || (resp.status >= 300 && resp.status < 400)) {
-    throw new Error('Session expired — hit GET /login to re-authenticate');
-  }
-  if (!resp.ok) {
-    throw new Error(`ScheduleList API failed: HTTP ${resp.status}`);
-  }
-
-  const data = await resp.json();
-
+  const data = await blackbaudFetch(
+    `/api/datadirect/ScheduleList?viewerId=${studentId}&personaId=null&viewerPersonaId=null&start=${startUnix}&end=${endUnix}`
+  );
   if (!Array.isArray(data) || data.length === 0) {
     throw new Error('Session expired — hit GET /login to re-authenticate');
   }
-
   log.info(`ScheduleList returned ${data.length} items`);
+  // Persist for offline inspection / field discovery (overwrites each fetch)
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, `schedule-raw-${studentId}.json`), JSON.stringify(data, null, 2));
+  } catch (e) {
+    log.warn(`Failed to save raw schedule JSON: ${e.message}`);
+  }
+  return data;
+}
 
-  // Format structured data into readable text with teacher/room details
-  return formatScheduleData(data);
+/**
+ * Convert one /api/mycalendar/events item into the ScheduleList-shaped
+ * record formatScheduleData expects. The synthesized `title` carries the
+ * Practice/Game distinction, opponent, and home/away — those are not in the
+ * ScheduleList response.
+ */
+function normalizeMyCalendarEvent(ev) {
+  const base = ev.GroupName || ev.Title || 'Event';
+  const tag = ev.EventType && ev.EventType.toLowerCase() !== 'practice'
+    ? ` — ${ev.EventType.toUpperCase()}${ev.HomeAway ? ` (${ev.HomeAway})` : ''}${ev.Opponent ? ` vs ${ev.Opponent}` : ''}`
+    : (ev.EventType ? ` — ${ev.EventType}` : '');
+  const cancelPrefix = ev.Cancelled ? 'CANCELLED: ' : '';
+  let title = `${cancelPrefix}${base}${tag}`;
+  if (ev.Rescheduled || (ev.RescheduleNote && ev.RescheduleNote.trim())) {
+    const note = ev.RescheduleNote && ev.RescheduleNote.trim() ? ev.RescheduleNote.trim() : 'rescheduled';
+    title += ` [rescheduled${note ? `: ${note}` : ''}]`;
+  }
+  const startMs = Date.parse(ev.StartDate);
+  // Games typically come back with EndDate=null. Default to start + 1h so
+  // the formatted line doesn't read "3:45 PM - 3:45 PM".
+  let end = ev.EndDate;
+  if (!end && Number.isFinite(startMs)) {
+    end = new Date(startMs + 60 * 60 * 1000).toLocaleString('en-US', {
+      month: 'numeric', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit', hour12: true,
+    }).replace(',', '');
+  }
+  return {
+    title,
+    start: ev.StartDate,
+    end: end || ev.StartDate,
+    allDay: !!ev.AllDay,
+    facultyName: ev.ContactName || '',
+    buildingName: ev.BuildingName || '',
+    roomName: ev.RoomName || '',
+    roomNumber: '',
+    startTicks: Number.isFinite(startMs) ? startMs * 10000 : 0,
+    _source: 'mycalendar',
+    EventType: ev.EventType,
+    Opponent: ev.Opponent,
+    HomeAway: ev.HomeAway,
+    Cancelled: ev.Cancelled,
+    Rescheduled: ev.Rescheduled,
+    GroupId: ev.GroupId,
+  };
+}
+
+async function scrapeSchedule(studentId) {
+  // Pull the academic schedule (works without antiforgery, has teacher/room).
+  const scheduleItems = await fetchRawSchedule(studentId);
+
+  // Mae's team SectionIds — anything with offeringType=9 in ScheduleList is
+  // a team she's on. We use this to filter the parent's-view mycalendar
+  // response down to just *her* teams (the filterString covers every team
+  // the parent follows, which is way too noisy for one kid's schedule).
+  const myTeamIds = new Set(scheduleItems.filter(ev => ev.offeringType === 9).map(ev => ev.SectionId));
+
+  // Drop ScheduleList athletic entries — they don't carry game/opponent
+  // details. Replace with richer mycalendar/events records. If mycalendar
+  // fetch fails (no filter configured, token discovery failed, etc.), fall
+  // back to ScheduleList alone.
+  let merged = scheduleItems;
+  try {
+    const calItems = await fetchRawCalendar();
+    const seen = new Set();
+    const athletics = [];
+    for (const ev of calItems) {
+      const isAthletic = ev.PresetTypeId === 9 || /^(Game|Practice|Scrimmage|Tournament)$/i.test(ev.EventType || '');
+      if (!isAthletic) continue;
+      // Restrict to this student's teams. If we couldn't determine the team
+      // set (no offeringType=9 in ScheduleList), let everything through and
+      // let the user notice the noise.
+      if (myTeamIds.size > 0 && !myTeamIds.has(ev.GroupId)) continue;
+      // Dedup: parent's filter often references a team via multiple presets,
+      // each returning the same event. Key by (StartDate, GroupId, EventType, Opponent).
+      const key = `${ev.StartDate}|${ev.GroupId}|${ev.EventType}|${ev.Opponent || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      athletics.push(normalizeMyCalendarEvent(ev));
+    }
+    if (athletics.length > 0) {
+      merged = scheduleItems
+        .filter(ev => ev.offeringType !== 9)
+        .concat(athletics);
+      log.info(`Merged ${athletics.length} athletic events from mycalendar/events (teams: ${[...myTeamIds].join(',') || 'all'})`);
+    } else {
+      log.info(`No matching athletics from mycalendar/events for teams ${[...myTeamIds].join(',') || '(none in ScheduleList)'}`);
+    }
+  } catch (e) {
+    log.warn(`mycalendar/events merge skipped: ${e.message}`);
+  }
+
+  return formatScheduleData(merged);
+}
+
+// Fields the formatter handles explicitly — anything else non-empty on a
+// non-classroom event gets surfaced via `extraFieldsLine` so Claude can see
+// game/practice/opponent indicators without us hardcoding their field names.
+// We also skip the mycalendar synthesized fields (those are baked into the
+// title by normalizeMyCalendarEvent so re-listing them is just noise).
+const SCHEDULE_HANDLED_KEYS = new Set([
+  'title', 'start', 'end', 'allDay', 'startTicks', 'endTicks',
+  'facultyName', 'buildingName', 'roomNumber', 'roomName',
+  '_source', 'EventType', 'Opponent', 'HomeAway', 'Cancelled', 'Rescheduled', 'GroupId',
+]);
+
+function extraFieldsLine(ev) {
+  const parts = [];
+  for (const [key, val] of Object.entries(ev)) {
+    if (SCHEDULE_HANDLED_KEYS.has(key)) continue;
+    if (val == null || val === '' || val === false) continue;
+    if (typeof val === 'object') continue; // skip nested
+    if (/Id$|Identifier$|Guid$|Uid$|Token$/i.test(key)) continue; // skip bookkeeping
+    parts.push(`${key}=${val}`);
+  }
+  return parts.length ? parts.join(', ') : '';
 }
 
 function formatScheduleData(items) {
@@ -664,11 +941,18 @@ function formatScheduleData(items) {
       const startTime = ev.start.replace(/^\S+\s+/, '');
       const endTime = ev.end.replace(/^\S+\s+/, '');
 
+      const isClassroom = !!(ev.buildingName || ev.roomNumber);
       let detail = `  ${startTime} - ${endTime}: ${ev.title}`;
       if (ev.facultyName) detail += ` | Teacher: ${ev.facultyName}`;
-      if (ev.buildingName || ev.roomNumber) {
+      if (isClassroom) {
         const room = [ev.buildingName, ev.roomNumber].filter(Boolean).join(' ');
         detail += ` | Room: ${room}`;
+      } else {
+        // Non-classroom event (athletic practice/game, club, assembly, etc.) —
+        // surface every other non-empty field so games can be distinguished
+        // from practices regardless of which sport is in season.
+        const extras = extraFieldsLine(ev);
+        if (extras) detail += ` | ${extras}`;
       }
       lines.push(detail);
     }
@@ -829,7 +1113,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'get_schedule',
-    description: "Get a child's class schedule. Mae (Middle School) has a daily rotation schedule from Blackbaud with Gray/Scarlet days. Effie (Lower School) has a fixed weekly schedule.",
+    description: "Get a child's full daily schedule from Blackbaud. The schedule IS the calendar — there is no separate calendar source. For Mae (Middle School) it includes academic classes (Gray/Scarlet rotation), advisory, lunch, AND after-school athletic events (practices and games for whichever sport is in season). For Effie (Lower School) it is a fixed weekly class schedule. Use this tool for ANY time-of-day or calendar-style question — classes, sports, practices, games, after-school activities, 'where is she right now', 'what does she have today/tomorrow/this week'.",
     input_schema: {
       type: 'object',
       properties: {
@@ -882,19 +1166,27 @@ async function executeTool(name, input) {
 /* ----------------------- claude agentic loop ----------------------------- */
 
 function buildSystemPrompt() {
-  const today = new Date();
-  const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long' });
-  const dateStr = today.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const now = new Date();
+  const dayOfWeek = now.toLocaleDateString('en-US', { weekday: 'long' });
+  const dateStr = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   return `You are a helpful assistant that answers questions about Mark's children's school data from Friends School of Baltimore.
 
-Today is ${dayOfWeek}, ${dateStr}.
+Right now it is ${dayOfWeek}, ${dateStr} at ${timeStr} (${tz}). Use this when the user asks about "right now", "today", "tomorrow", "this week", or any other relative time — do not say you don't know the current time.
 
 Children:
 - Mae (6th Grade, Middle School) — has a full rotation schedule with Gray/Scarlet days
 - Effie (4th Grade, Lower School) — has a fixed weekly schedule (same every week)
 
 You have tools to fetch their assignments and schedules from Blackbaud. Use the appropriate tool(s) based on the query. For broad queries about "the kids" or "both", use get_all_data. Questions like "where is Mae right now", "what are the kids doing", or "what class does Effie have" are SCHEDULE questions — always fetch the schedule for those.
+
+CRITICAL — calendar/schedule routing:
+- The Blackbaud schedule IS the calendar. There is no separate calendar system. The schedule contains classes, advisory, lunch, AND every after-school activity including athletic practices and games (whichever sport is in season).
+- If the user mentions "calendar", "schedule", "today", "tomorrow", "this week", "next week", "sport", "sports", "game", "practice", "event", "after school", "where is she", or asks what a child has/is doing — call get_schedule first.
+- NEVER respond "I don't have access to your personal calendar" or "that's on a separate athletics calendar" or anything similar. Those answers are wrong. You always have the calendar via get_schedule.
+- If the schedule comes back and has nothing for the queried date or topic, say so plainly (e.g., "Nothing on Mae's schedule for that"). Do not blame missing access.
 
 RESPONSE FORMAT — follow this strictly:
 1. FIRST: Answer the specific question directly. Only include what was asked.
@@ -1101,6 +1393,98 @@ function createRequestHandler() {
         });
       }
 
+      // Force-refresh cache. Body: { child: "mae"|"effie"|"all", type: "schedule"|"assignments"|"all" }
+      // Bypasses TTL, invalidates the cache entry, refetches via the same scrapers
+      // get_assignments / get_schedule use, returns the fresh formatted text.
+      if (req.method === 'POST' && urlPath === '/refresh') {
+        const body = await readBody().catch(() => ({}));
+        const childArg = String(body.child || 'all').toLowerCase();
+        const typeArg = String(body.type || 'all').toLowerCase();
+        const children = childArg === 'all' ? Object.keys(STUDENTS) : [childArg];
+        const types = typeArg === 'all' ? ['assignments', 'schedule'] : [typeArg];
+
+        for (const c of children) if (!STUDENTS[c]) return sendJson(400, { ok: false, error: `Unknown child: ${c}` });
+        for (const t of types) if (t !== 'assignments' && t !== 'schedule') return sendJson(400, { ok: false, error: `Unknown type: ${t}` });
+
+        const results = {};
+        for (const c of children) {
+          results[c] = {};
+          for (const t of types) {
+            invalidateCache(c, t);
+            const fn = t === 'assignments' ? getAssignments : getSchedule;
+            try {
+              results[c][t] = await fn(c);
+            } catch (e) {
+              results[c][t] = { error: e.message };
+            }
+          }
+        }
+        return sendJson(200, { ok: true, refreshed: results, freshness: buildFreshnessInfo() });
+      }
+
+      // Raw Blackbaud API JSON for a child + type. Bypasses cache and formatting —
+      // intended for inspecting field shapes when the formatted output is missing
+      // something. Query: ?child=mae&type=schedule (or assignments).
+      if (req.method === 'GET' && urlPath === '/raw') {
+        const childArg = String(parsedUrl.searchParams.get('child') || '').toLowerCase();
+        const typeArg = String(parsedUrl.searchParams.get('type') || '').toLowerCase();
+        const student = STUDENTS[childArg];
+        if (!student) return sendJson(400, { ok: false, error: `child must be one of: ${Object.keys(STUDENTS).join(', ')}` });
+        if (typeArg !== 'schedule' && typeArg !== 'assignments') {
+          return sendJson(400, { ok: false, error: `type must be schedule or assignments` });
+        }
+        try {
+          const data = typeArg === 'schedule'
+            ? await fetchRawSchedule(student.id)
+            : await fetchRawAssignments(student.id);
+          return sendJson(200, { ok: true, child: childArg, type: typeArg, studentId: student.id, count: Array.isArray(data) ? data.length : undefined, data });
+        } catch (e) {
+          return sendJson(500, { ok: false, error: e.message });
+        }
+      }
+
+      // Generic Blackbaud API proxy. Body: { path, method, body, headers, useBrowser? }
+      // Localhost-only escape hatch — uses the server's authenticated cookies so
+      // future agents can probe endpoints (athletics calendar, contests, etc.)
+      // without re-implementing auth.
+      //
+      // Set `useBrowser: true` to route the call through the existing Playwright
+      // page instead of Node fetch — required for endpoints that need the
+      // antiforgery `requestverificationtoken` header (e.g. POSTs like
+      // /api/mycalendar/events).
+      if (req.method === 'POST' && urlPath === '/api-proxy') {
+        const remote = req.socket.remoteAddress || '';
+        if (!/^(127\.|::1|::ffff:127\.)/.test(remote)) {
+          return sendJson(403, { ok: false, error: 'api-proxy is localhost-only' });
+        }
+        const body = await readBody().catch(() => ({}));
+        const apiPath = String(body.path || '');
+        if (!apiPath.startsWith('/')) return sendJson(400, { ok: false, error: 'path must start with "/"' });
+        const method = String(body.method || 'GET').toUpperCase();
+        try {
+          const opts = { method, body: body.body, extraHeaders: body.headers };
+          const data = body.useBrowser
+            ? await browserApiCall(apiPath, opts)
+            : await blackbaudFetch(apiPath, opts);
+          return sendJson(200, { ok: true, path: apiPath, method, transport: body.useBrowser ? 'browser' : 'node', data });
+        } catch (e) {
+          return sendJson(500, { ok: false, error: e.message });
+        }
+      }
+
+      // Convenience: hit /api/mycalendar/events with the configured filter.
+      // Query: ?start=YYYY-MM-DD&end=YYYY-MM-DD (both optional).
+      if (req.method === 'GET' && urlPath === '/raw-calendar') {
+        const startDate = parsedUrl.searchParams.get('start') || undefined;
+        const endDate = parsedUrl.searchParams.get('end') || undefined;
+        try {
+          const data = await fetchRawCalendar({ startDate, endDate });
+          return sendJson(200, { ok: true, count: data.length, data });
+        } catch (e) {
+          return sendJson(500, { ok: false, error: e.message });
+        }
+      }
+
       // Natural language endpoint
       if (req.method === 'POST' && urlPath === '/nl') {
         const body = await readBody();
@@ -1155,7 +1539,7 @@ function createRequestHandler() {
       }
 
       // 404
-      sendJson(404, { ok: false, error: 'Not found. Endpoints: GET /login, POST /nl, GET /health, GET /data' });
+      sendJson(404, { ok: false, error: 'Not found. Endpoints: GET /login, POST /nl, GET /health, GET /data, POST /refresh, GET /raw, GET /raw-calendar, POST /api-proxy' });
     } catch (e) {
       log.error('Request error:', e.message);
       sendJson(500, { ok: false, error: e.message });
@@ -1169,7 +1553,7 @@ function startServer(port) {
 
   server.listen(listenPort, () => {
     log.info(`FriendsSchool server listening on port ${listenPort}`);
-    log.info(`Endpoints: GET /login, POST /nl, GET /health, GET /data`);
+    log.info(`Endpoints: GET /login, POST /nl, GET /health, GET /data, POST /refresh, GET /raw, GET /raw-calendar, POST /api-proxy`);
     if (!ANTHROPIC_API_KEY) {
       log.warn('ANTHROPIC_API_KEY not set — /nl endpoint will not work.');
     }
@@ -1187,7 +1571,10 @@ module.exports = {
   // Config
   STUDENTS, ASSIGNMENT_TTL, SCHEDULE_TTL, TOOL_DEFINITIONS,
   // Cache
-  cache, getCached, setCache, initCache,
+  cache, getCached, setCache, initCache, invalidateCache,
+  // Blackbaud API helpers
+  blackbaudFetch, browserApiCall, fetchRawSchedule, fetchRawAssignments, fetchRawCalendar,
+  loadCalendarFilter, normalizeMyCalendarEvent,
   // Time helpers
   timeAgo, isFresh, nowIso,
   // Data fetchers (depend on scrapers)
@@ -1212,6 +1599,22 @@ module.exports = {
 if (require.main === module) {
   initCache();
   const server = startServer();
+
+  // Auto-login on startup. The persistent Playwright profile usually carries a
+  // valid session, so login() returns immediately without a visible browser.
+  // If the session has truly expired, login() will pop a visible browser for
+  // Google SSO — same as `curl /login` would. Fire-and-forget so the HTTP
+  // server starts serving immediately.
+  (async () => {
+    try {
+      log.info('[STARTUP] Attempting auto-login from persisted profile...');
+      await login();
+      log.info('[STARTUP] Auto-login succeeded — server is ready.');
+    } catch (e) {
+      log.warn(`[STARTUP] Auto-login failed: ${e.message}`);
+      log.warn('[STARTUP] Hit GET /login to authenticate manually.');
+    }
+  })();
 
   async function shutdown(signal) {
     log.info(`${signal} received, shutting down...`);

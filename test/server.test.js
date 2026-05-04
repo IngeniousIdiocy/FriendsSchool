@@ -14,6 +14,13 @@ process.env.LOG_LEVEL = 'error';
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'friendsschool-test-'));
 process.env.FRIENDSSCHOOL_DATA_DIR = TEST_DATA_DIR;
 
+// Effie's schedule is read from data/effie-schedule.csv at module load time.
+// Seed a stub copy in the temp dir so the static-CSV path works under tests.
+fs.writeFileSync(
+  path.join(TEST_DATA_DIR, 'effie-schedule.csv'),
+  'Time,Monday,Tuesday,Wednesday,Thursday,Friday\n8:00,Homeroom,Homeroom,Homeroom,Homeroom,Homeroom\n'
+);
+
 const server = require('../server');
 server._setDataDir(TEST_DATA_DIR);
 
@@ -166,9 +173,10 @@ describe('executeTool', () => {
     assert.match(result.freshness, /current/);
   });
 
-  it('get_schedule returns cached data for effie', async () => {
-    const result = await server.executeTool('get_schedule', { child: 'effie' });
-    assert.equal(result.data, 'Effie: Homeroom');
+  it('get_schedule returns cached data for mae', async () => {
+    // Effie's schedule is served from a static CSV, not the cache — use Mae here.
+    const result = await server.executeTool('get_schedule', { child: 'mae' });
+    assert.equal(result.data, 'Mae: Period 1 English, Period 2 Math');
     assert.ok(result.freshness);
     assert.match(result.freshness, /current/);
   });
@@ -178,7 +186,10 @@ describe('executeTool', () => {
     assert.ok(result.mae);
     assert.ok(result.effie);
     assert.equal(result.mae.assignments.data, 'Mae math homework due tomorrow');
-    assert.equal(result.effie.schedule.data, 'Effie: Homeroom');
+    assert.equal(result.mae.schedule.data, 'Mae: Period 1 English, Period 2 Math');
+    assert.equal(result.effie.assignments.data, 'Effie reading log due Friday');
+    // Effie's schedule comes from the static CSV, not the cache
+    assert.ok(result.effie.schedule.data);
   });
 
   it('unknown tool returns error', async () => {
@@ -197,9 +208,9 @@ describe('executeTool', () => {
 /* ========================= buildSystemPrompt ============================= */
 
 describe('buildSystemPrompt', () => {
-  it('includes today date info', () => {
+  it('includes current date and time', () => {
     const prompt = server.buildSystemPrompt();
-    assert.ok(prompt.includes('Today is'));
+    assert.ok(prompt.includes('Right now it is'));
   });
 
   it('mentions both children', () => {
@@ -498,11 +509,20 @@ describe('getAssignments / getSchedule with stale fallback', () => {
   });
 
   it('getSchedule serves from cache when fresh', async () => {
-    server.setCache('effie', 'schedule', 'Schedule data');
-    const result = await server.getSchedule('effie');
+    // Mae's schedule uses the cache; Effie's bypasses it for the static CSV.
+    server.setCache('mae', 'schedule', 'Schedule data');
+    const result = await server.getSchedule('mae');
     assert.equal(result.data, 'Schedule data');
     assert.ok(result.freshness);
     assert.match(result.freshness, /current/);
+  });
+
+  it('getSchedule for effie returns the static CSV regardless of cache', async () => {
+    server.setCache('effie', 'schedule', 'STALE CACHE THAT SHOULD BE IGNORED');
+    const result = await server.getSchedule('effie');
+    assert.notEqual(result.data, 'STALE CACHE THAT SHOULD BE IGNORED');
+    assert.ok(result.data);
+    assert.match(result.freshness, /Static schedule/);
   });
 });
 
